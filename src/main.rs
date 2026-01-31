@@ -1,9 +1,8 @@
-use bevy::prelude::*;
+use bevy::{prelude::*, window::PresentMode};
 use rand::Rng;
-use std::cell::RefCell;
-use std::collections::HashMap;
 
 mod fps;
+mod utils;
 
 #[derive(Component, Debug, Clone)]
 struct Velocity {
@@ -14,48 +13,30 @@ struct Velocity {
 #[derive(Component, Debug, Clone)]
 struct ReadonlyProps {
     radius: i32,
-    color: Color,
 }
 
 fn non_zero_rand<R: Rng>(rng: &mut R, min: f32, max: f32) -> f32 {
-    let range = max - min;
-    let mut val = rng.random_range(min..max);
-    if val.abs() < 1.0 {
-        val = if val > 0.0 { 1.0 } else { -1.0 } + rng.random_range(0.0..(range - 2.0));
-        val = val.clamp(min, max);
+    let val = rng.random_range(min..max);
+    if val.abs() < 5.0 {
+        if val < 0.0 {
+            return rng.random_range(min..-5.0);
+        }
+        return rng.random_range(5.0..max);
     }
     val
 }
 
-fn gen_balls(
-    mut cmds: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-    winq: Query<&Window>,
-) {
+fn gen_balls(mut cmds: Commands, mut images: ResMut<Assets<Image>>, winq: Query<&Window>) {
     cmds.spawn(Camera2d);
 
-    let shapes = RefCell::new(HashMap::<i32, Handle<Mesh>>::default());
-
-    let mut mkcircle = |radius: i32| -> Handle<Mesh> {
-        {
-            let binding = shapes.borrow();
-            let prev = binding.get(&radius);
-            if let Some(prev) = prev {
-                return prev.clone();
-            }
-        }
-        let handle = meshes.add(Circle::new(radius as f32));
-        shapes.borrow_mut().insert(radius, handle.clone());
-        return handle;
-    };
+    let circle = images.add(utils::create_circle_image(64));
 
     let (x, y) = query_half_win_size(&winq);
     let mut rng = rand::rng();
-    let vx = x * 2.0 / 4.0;
-    let vy = y * 2.0 / 4.0;
+    let vx = x;
+    let vy = y;
 
-    for _ in 0..50000 {
+    for _ in 0..1000 {
         let pos = Vec2 {
             x: rng.random_range(-x..x),
             y: rng.random_range(-y..y),
@@ -64,26 +45,28 @@ fn gen_balls(
             x: non_zero_rand(&mut rng, -vx, vx),
             y: non_zero_rand(&mut rng, -vy, vy),
         };
-        let props = ReadonlyProps {
-            radius: rng.random_range(5..20),
-            color: Color::srgba(
-                rng.random_range(0.0..1.0),
-                rng.random_range(0.0..1.0),
-                rng.random_range(0.0..1.0),
-                rng.random_range(0.5..1.0),
-            ),
-        };
-
-        let shape = Mesh2d(mkcircle(props.radius));
-
-        let material = MeshMaterial2d(materials.add(props.color));
+        let radius = rng.random_range(5..20);
+        let props = ReadonlyProps { radius };
+        let color = Color::srgba(
+            rng.random_range(0.0..1.0),
+            rng.random_range(0.0..1.0),
+            rng.random_range(0.0..1.0),
+            rng.random_range(0.5..1.0),
+        );
 
         cmds.spawn((
             vel,
             props,
-            shape,
-            material,
-            Transform::from_xyz(pos.x, pos.y, 0.0),
+            Sprite {
+                image: circle.clone(),
+                color,
+                custom_size: Some(Vec2::splat((radius * 2) as f32)),
+                ..default()
+            },
+            Transform {
+                translation: Vec3::new(pos.x, pos.y, 0.0),
+                ..default()
+            },
         ));
     }
 }
@@ -101,29 +84,75 @@ fn update_balls(
     let (hwx, hwy) = query_half_win_size(&winq);
     let delta = time.delta_secs();
 
-    for (mut velocity, mut transform, props) in query.iter_mut() {
-        let mut position = transform.translation.xy();
-        position.x += velocity.x * delta;
-        position.y += velocity.y * delta;
+    query
+        .par_iter_mut()
+        .for_each(|(mut velocity, mut transform, props)| {
+            let mut position = transform.translation.xy();
+            position.x += velocity.x * delta;
+            position.y += velocity.y * delta;
 
-        let radius = props.radius as f32;
+            let radius = props.radius as f32;
+            let xdiff = hwx - radius;
+            let ydiff = hwy - radius;
 
-        if position.x + radius > hwx || position.x - radius < -hwx {
-            velocity.x = -velocity.x;
+            if position.x < -xdiff {
+                velocity.x = -velocity.x;
+                position.x = radius - hwx + 1.0;
+            } else if position.x > xdiff {
+                velocity.x = -velocity.x;
+                position.x = xdiff - 1.0;
+            }
+
+            if position.y < -ydiff {
+                velocity.y = -velocity.y;
+                position.y = radius - hwy;
+            } else if position.y > ydiff {
+                velocity.y = -velocity.y + 1.0;
+                position.y = ydiff - 1.0;
+            }
+
+            transform.translation = Vec3::new(position.x, position.y, 0.0);
+        });
+}
+
+#[derive(States, Debug, Clone, PartialEq, Eq, Hash, Default)]
+enum AppState {
+    #[default]
+    Running,
+    Paused,
+}
+
+fn handle_keyboard_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    state: Res<State<AppState>>,
+    mut next_state: ResMut<NextState<AppState>>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        std::process::exit(0);
+    }
+
+    if keys.just_pressed(KeyCode::F9) {
+        match state.get() {
+            AppState::Running => next_state.set(AppState::Paused),
+            AppState::Paused => next_state.set(AppState::Running),
         }
-
-        if position.y + radius > hwy || position.y - radius < -hwy {
-            velocity.y = -velocity.y;
-        }
-        transform.translation = Vec3::new(position.x, position.y, 0.0);
     }
 }
 
 fn main() {
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(Window {
+                present_mode: PresentMode::Immediate,
+                mode: bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Primary),
+                ..default()
+            }),
+            ..default()
+        }))
+        .init_state::<AppState>()
         .add_systems(Startup, gen_balls)
-        .add_systems(Update, update_balls)
+        .add_systems(Update, update_balls.run_if(in_state(AppState::Running)))
+        .add_systems(Update, handle_keyboard_input)
         .add_plugins(fps::FpsPlugin)
         .run();
 }
